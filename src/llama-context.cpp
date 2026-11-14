@@ -3552,6 +3552,12 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if ((params.type_k == GGML_TYPE_BQ2_0) != (params.type_v == GGML_TYPE_BQ2_0)) {
+        LLAMA_LOG_ERROR("%s: KV cache type bq2_0 requires both K and V to be bq2_0 (got K=%s, V=%s)\n",
+            __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
         params.pooling_type != model->hparams.pooling_type) {
         //user-specified pooling-type is different from the model default

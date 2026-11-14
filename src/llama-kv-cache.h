@@ -217,6 +217,32 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    //
+    // KV1 (GGML_TYPE_BQ2_0): attention sinks
+    //
+    // The first kv1_n_sink positions of every sequence keep full-precision K/V. They live in a small F16 side
+    // table per layer with kv1_n_sink slots per sequence (slot = seq_id*kv1_n_sink + pos), plus one scratch row
+    // that absorbs the writes of all other tokens. A host-side map remembers which cache cell owns each slot.
+    // For attention, the 2-bit cache view is dequantized to F16 and the rows of the sink cells are replaced
+    // with the exact values from the side table.
+    //
+
+    static constexpr llama_pos kv1_n_sink = 4;
+
+    bool    kv1_sinks()   const { return kv1; }
+    int64_t kv1_n_slots() const { return (int64_t) n_seq_max*kv1_n_sink; }
+
+    // write the current K or V rows into the side table (returns the updated side table)
+    ggml_tensor * kv1_cpy_sink(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v) const;
+
+    // dequantize a K/V view to F16 and patch in the sink rows (slots/cells may be null when there is nothing to patch)
+    ggml_tensor * kv1_patch(ggml_context * ctx, ggml_tensor * view, ggml_tensor * side, ggml_tensor * slots, ggml_tensor * cells) const;
+
+    // (slot, row in the [n_kv*ns] view) pairs for the sink cells visible in the current view
+    void kv1_sink_read(const slot_info & sinfo, uint32_t n_kv, std::vector<int32_t> * slots, std::vector<int64_t> * rows) const;
+
+    void kv1_set_input_w(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -231,6 +257,10 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // KV1 sink side tables: F16 [n_embd_gqa, kv1_n_slots() + 1]
+        ggml_tensor * k_sink = nullptr;
+        ggml_tensor * v_sink = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -258,6 +288,19 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // KV1 sinks: true when the cache type is GGML_TYPE_BQ2_0
+    bool kv1 = false;
+
+    struct kv1_owner {
+        int32_t strm = -1;
+        int32_t cell = -1;
+    };
+
+    // slot -> cache cell whose K/V the slot holds
+    std::vector<kv1_owner> kv1_owners;
+
+    void kv1_reset_owners(llama_seq_id seq_id = -1);
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -398,6 +441,13 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // KV1 sinks (see llama_kv_cache)
+    bool kv1_sinks() const;
+    void kv1_sink_read(std::vector<int32_t> * slots, std::vector<int64_t> * rows) const;
+    ggml_tensor * kv1_cpy_sink(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v) const;
+    ggml_tensor * kv1_patch(ggml_context * ctx, ggml_tensor * view, ggml_tensor * side, ggml_tensor * slots, ggml_tensor * cells) const;
+    void kv1_set_input_w(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_status status;

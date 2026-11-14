@@ -501,6 +501,43 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    set_input_kv1(mctx, ubatch);
+}
+
+void llm_graph_input_attn_kv::set_input_kv1(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch) {
+    if (!self_kv1_w) {
+        return;
+    }
+
+    mctx->kv1_set_input_w(self_kv1_w, ubatch);
+
+    if (self_kv1_slots) {
+        std::vector<int32_t> slots;
+        std::vector<int64_t> rows;
+        mctx->kv1_sink_read(&slots, &rows);
+
+        GGML_ASSERT((int64_t) slots.size() == self_kv1_slots->ne[0]);
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kv1_slots->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kv1_rows->buffer));
+
+        memcpy(self_kv1_slots->data, slots.data(), ggml_nbytes(self_kv1_slots));
+        memcpy(self_kv1_rows ->data, rows .data(), ggml_nbytes(self_kv1_rows));
+    }
+}
+
+bool llm_graph_input_attn_kv::can_reuse_kv1(const llama_kv_cache_context * mctx) const {
+    if (!mctx->kv1_sinks()) {
+        return self_kv1_w == nullptr;
+    }
+
+    std::vector<int32_t> slots;
+    std::vector<int64_t> rows;
+    mctx->kv1_sink_read(&slots, &rows);
+
+    const int64_t n_cur = self_kv1_slots ? self_kv1_slots->ne[0] : 0;
+
+    return self_kv1_w != nullptr && n_cur == (int64_t) slots.size();
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -514,6 +551,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    res &= can_reuse_kv1(mctx);
 
     return res;
 }
@@ -966,6 +1005,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    inp_attn->set_input_kv1(mctx->get_attn(), ubatch);
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -990,6 +1031,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    res &= inp_attn->can_reuse_kv1(mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2606,6 +2649,25 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    if (mctx_cur->kv1_sinks()) {
+        inp->self_kv1_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_tokens);
+        ggml_set_input(inp->self_kv1_w);
+        ggml_set_name(inp->self_kv1_w, "attn_inp_kv1_w");
+
+        std::vector<int32_t> slots;
+        std::vector<int64_t> rows;
+        mctx_cur->kv1_sink_read(&slots, &rows);
+
+        if (!slots.empty()) {
+            inp->self_kv1_slots = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, slots.size());
+            inp->self_kv1_rows  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, rows.size());
+            ggml_set_input(inp->self_kv1_slots);
+            ggml_set_input(inp->self_kv1_rows);
+            ggml_set_name(inp->self_kv1_slots, "attn_inp_kv1_slots");
+            ggml_set_name(inp->self_kv1_rows,  "attn_inp_kv1_rows");
+        }
+    }
+
     return inp;
 }
 
@@ -2659,11 +2721,26 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    // KV1: keep the exact K/V of the sink tokens in the side tables
+    ggml_tensor * k_sink = nullptr;
+    ggml_tensor * v_sink = nullptr;
+    if (inp->self_kv1_w) {
+        k_sink = mctx_cur->kv1_cpy_sink(ctx0, k_cur, inp->self_kv1_w, il, false);
+        v_sink = mctx_cur->kv1_cpy_sink(ctx0, v_cur, inp->self_kv1_w, il, true);
+        ggml_build_forward_expand(gf, k_sink);
+        ggml_build_forward_expand(gf, v_sink);
+    }
+
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    if (inp->self_kv1_w) {
+        k = mctx_cur->kv1_patch(ctx0, k, k_sink, inp->self_kv1_slots, inp->self_kv1_rows);
+        v = mctx_cur->kv1_patch(ctx0, v, v_sink, inp->self_kv1_slots, inp->self_kv1_rows);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

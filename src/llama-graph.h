@@ -335,6 +335,14 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // KV1 (bq2_0) attention sinks
+    ggml_tensor * self_kv1_w     = nullptr; // I64 [n_batch]  side-table row written by each token
+    ggml_tensor * self_kv1_slots = nullptr; // I32 [n_patch]  side-table rows to read
+    ggml_tensor * self_kv1_rows  = nullptr; // I64 [n_patch]  rows of the [n_kv*ns] view they replace
+
+    void set_input_kv1(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch);
+    bool can_reuse_kv1(const llama_kv_cache_context * mctx) const;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return

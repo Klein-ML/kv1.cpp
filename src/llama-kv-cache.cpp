@@ -13,6 +13,9 @@
 #include <map>
 #include <stdexcept>
 
+// KV1 BQ2_0: one quantization block is one head vector
+static constexpr int QK_BQ2_0_HEAD = 64;
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -247,6 +250,27 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
+        // KV1: BQ2_0 needs both K and V in BQ2_0, one block per head (head_dim 64) and a non-transposed V
+        ggml_tensor * k_sink = nullptr;
+        ggml_tensor * v_sink = nullptr;
+        if (type_k == GGML_TYPE_BQ2_0 || type_v == GGML_TYPE_BQ2_0) {
+            if (type_k != type_v || !has_v) {
+                throw std::runtime_error("KV cache type bq2_0 requires both K and V to be bq2_0 (-ctk bq2_0 -ctv bq2_0)");
+            }
+            if (hparams.n_embd_head_k(il) != QK_BQ2_0_HEAD || hparams.n_embd_head_v(il) != QK_BQ2_0_HEAD) {
+                throw std::runtime_error(format("KV cache type bq2_0 requires head_dim %d, layer %d has K/V head_dim %d/%d",
+                            QK_BQ2_0_HEAD, il, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il)));
+            }
+            if (v_trans) {
+                throw std::runtime_error("KV cache type bq2_0 requires flash attention (-fa on)");
+            }
+            kv1 = true;
+            k_sink = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_k_gqa, kv1_n_slots() + 1);
+            v_sink = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd_v_gqa, kv1_n_slots() + 1);
+            ggml_format_name(k_sink, "cache_k_sink_l%d", il);
+            ggml_format_name(v_sink, "cache_v_sink_l%d", il);
+        }
+
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
@@ -260,7 +284,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, k_sink, v_sink, });
     }
 
     if (reuse) {
@@ -377,6 +401,17 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    if (kv1) {
+        if (other) {
+            throw std::runtime_error("KV cache type bq2_0 does not support shared KV caches");
+        }
+        if (!attn_rot_k || !attn_rot_v) {
+            LLAMA_LOG_WARN("%s: bq2_0 without the Hadamard rotation (LLAMA_ATTN_ROT_DISABLE?) does not match KV1 training\n", __func__);
+        }
+        kv1_owners.assign(kv1_n_slots(), kv1_owner{});
+        LLAMA_LOG_INFO("%s: KV1 bq2_0: Hadamard rotation + %d full-precision sink tokens per sequence\n", __func__, (int) kv1_n_sink);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -384,6 +419,8 @@ void llama_kv_cache::clear(bool data) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
+
+    kv1_reset_owners();
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -471,6 +508,29 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
+
+    // KV1: the destination sequence gets its own copy of the source's sink slots
+    // (stream copies keep the cell indices, so the owner moves to stream s1 at the same cell)
+    if (kv1 && seq_id_src != seq_id_dst) {
+        for (llama_pos p = 0; p < kv1_n_sink; ++p) {
+            if ((p0 >= 0 && p < p0) || (p1 >= 0 && p >= p1)) {
+                continue;
+            }
+            const int64_t src = (int64_t) seq_id_src*kv1_n_sink + p;
+            const int64_t dst = (int64_t) seq_id_dst*kv1_n_sink + p;
+            if (kv1_owners[src].cell < 0) {
+                continue;
+            }
+            for (const auto & layer : layers) {
+                for (ggml_tensor * t : { layer.k_sink, layer.v_sink }) {
+                    std::vector<uint8_t> row(t->nb[1]);
+                    ggml_backend_tensor_get(t, row.data(), src*t->nb[1], t->nb[1]);
+                    ggml_backend_tensor_set(t, row.data(), dst*t->nb[1], t->nb[1]);
+                }
+            }
+            kv1_owners[dst] = { (int32_t) s1, kv1_owners[src].cell };
+        }
+    }
 
     if (s0 == s1) {
         // since both sequences are in the same stream, no data copy is necessary
@@ -1153,6 +1213,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
+
+            // KV1: the sink slot of the token's first sequence receives its K/V (see kv1_set_input_w)
+            if (kv1 && ubatch.pos[i] < kv1_n_sink) {
+                kv1_owners[(int64_t) ubatch.seq_id[i][0]*kv1_n_sink + ubatch.pos[i]] = { (int32_t) sinfo.strm[s], (int32_t) idx };
+            }
         }
     }
 
@@ -1185,6 +1250,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // KV1: the sink tokens are tied to positions 0..3, shifting would invalidate them
+    if (kv1) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1254,6 +1323,94 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     }
 
     return result;
+}
+
+void llama_kv_cache::kv1_reset_owners(llama_seq_id seq_id) {
+    if (!kv1) {
+        return;
+    }
+    for (int64_t slot = 0; slot < kv1_n_slots(); ++slot) {
+        if (seq_id < 0 || slot / kv1_n_sink == seq_id) {
+            kv1_owners[slot] = kv1_owner{};
+        }
+    }
+}
+
+ggml_tensor * llama_kv_cache::kv1_cpy_sink(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * side = is_v ? layers[ikv].v_sink : layers[ikv].k_sink;
+    GGML_ASSERT(side != nullptr);
+
+    const int64_t n_embd_gqa = cur->ne[0]*cur->ne[1];
+    const int64_t n_tokens   = cur->ne[2];
+
+    GGML_ASSERT(ggml_row_size(cur->type, cur->ne[0]) == cur->nb[1]);
+    GGML_ASSERT(n_embd_gqa == side->ne[0]);
+
+    cur = ggml_view_2d(ctx, cur, n_embd_gqa, n_tokens, cur->nb[2], 0);
+
+    return ggml_set_rows(ctx, side, cur, idxs);
+}
+
+ggml_tensor * llama_kv_cache::kv1_patch(ggml_context * ctx, ggml_tensor * view, ggml_tensor * side, ggml_tensor * slots, ggml_tensor * cells) const {
+    // [n_embd_head, n_head_kv, n_kv, ns] BQ2_0 view -> contiguous F16
+    ggml_tensor * res = ggml_cast(ctx, view, GGML_TYPE_F16);
+
+    if (slots == nullptr) {
+        return res;
+    }
+
+    const int64_t ne0 = res->ne[0], ne1 = res->ne[1], ne2 = res->ne[2], ne3 = res->ne[3];
+
+    ggml_tensor * rows = ggml_get_rows(ctx, side, slots); // F32 [n_embd_gqa, n_patch]
+
+    res = ggml_reshape_2d(ctx, res, ne0*ne1, ne2*ne3);
+    res = ggml_set_rows(ctx, res, rows, cells);
+    res = ggml_reshape_4d(ctx, res, ne0, ne1, ne2, ne3);
+
+    return res;
+}
+
+void llama_kv_cache::kv1_sink_read(const slot_info & sinfo, uint32_t n_kv, std::vector<int32_t> * slots, std::vector<int64_t> * rows) const {
+    slots->clear();
+    rows->clear();
+
+    if (!kv1) {
+        return;
+    }
+
+    for (int64_t slot = 0; slot < kv1_n_slots(); ++slot) {
+        const auto & o = kv1_owners[slot];
+        if (o.cell < 0 || o.strm < (int32_t) sinfo.s0 || o.strm > (int32_t) sinfo.s1 || o.cell >= (int32_t) n_kv) {
+            continue;
+        }
+
+        const auto & cells = v_cells[o.strm];
+
+        const llama_seq_id seq_id = slot / kv1_n_sink;
+        const llama_pos    pos    = slot % kv1_n_sink;
+
+        // the slot is still valid only if the cell holds this sequence at this position
+        if (cells.is_empty(o.cell) || cells.pos_get(o.cell) != pos || !cells.seq_has(o.cell, seq_id)) {
+            continue;
+        }
+
+        slots->push_back((int32_t) slot);
+        rows ->push_back((int64_t) (o.strm - sinfo.s0)*n_kv + o.cell);
+    }
+}
+
+void llama_kv_cache::kv1_set_input_w(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->ne[0] == ubatch->n_tokens);
+
+    int64_t * data = (int64_t *) dst->data;
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_pos pos = ubatch->pos[i];
+        data[i] = pos >= 0 && pos < kv1_n_sink ? (int64_t) ubatch->seq_id[i][0]*kv1_n_sink + pos : kv1_n_slots(); // last row = scratch
+    }
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -2050,6 +2207,13 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
+    if (kv1) {
+        // the sink side tables are not part of the session format: restored sequences fall back to the
+        // 2-bit values for positions 0..3 until they are decoded again
+        LLAMA_LOG_WARN("%s: bq2_0: full-precision sink tokens are not restored from saved state\n", __func__);
+        kv1_reset_owners(seq_id);
+    }
+
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
@@ -2641,6 +2805,26 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+bool llama_kv_cache_context::kv1_sinks() const {
+    return kv->kv1_sinks();
+}
+
+void llama_kv_cache_context::kv1_sink_read(std::vector<int32_t> * slots, std::vector<int64_t> * rows) const {
+    kv->kv1_sink_read(sinfos[i_cur], n_kv, slots, rows);
+}
+
+ggml_tensor * llama_kv_cache_context::kv1_cpy_sink(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il, bool is_v) const {
+    return kv->kv1_cpy_sink(ctx, cur, idxs, il, is_v);
+}
+
+ggml_tensor * llama_kv_cache_context::kv1_patch(ggml_context * ctx, ggml_tensor * view, ggml_tensor * side, ggml_tensor * slots, ggml_tensor * cells) const {
+    return kv->kv1_patch(ctx, view, side, slots, cells);
+}
+
+void llama_kv_cache_context::kv1_set_input_w(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->kv1_set_input_w(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {

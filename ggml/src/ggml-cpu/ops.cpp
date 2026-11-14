@@ -517,9 +517,16 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
         const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-        dequantize_row_q(
-                (const void *) ((char *) src0->data + x_offset),
-                     (float *) ((char *)  dst->data + dst_offset), qk);
+        if (dst->type == GGML_TYPE_F16) {
+            float tmp[256];
+            GGML_ASSERT(qk <= 256);
+            dequantize_row_q((const void *) ((char *) src0->data + x_offset), tmp, qk);
+            ggml_cpu_fp32_to_fp16(tmp, (ggml_fp16_t *) ((char *) dst->data + dst_offset), qk);
+        } else {
+            dequantize_row_q(
+                    (const void *) ((char *) src0->data + x_offset),
+                         (float *) ((char *)  dst->data + dst_offset), qk);
+        }
     }
 }
 
@@ -564,7 +571,7 @@ void ggml_compute_forward_dup(
             } break;
         default:
             {
-                if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
+                if (ggml_is_quantized(src0->type) && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
                     ggml_compute_forward_dup_from_q(params, dst);
                     break;
                 }

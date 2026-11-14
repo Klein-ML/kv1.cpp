@@ -8195,6 +8195,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {256, 4, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 4, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+
+    // KV1 bq2_0 (KV cache storage type): writes into the cache and the dequantizing reads
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_BQ2_0, GGML_TYPE_I64, { 512, 16, 1, 1 }, { 1, 1 }, 7, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_BQ2_0, GGML_TYPE_I64, { 64, 11, 1, 2 }, { 2, 3 }, 3, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_BQ2_0, GGML_TYPE_I32, { 128, 9, 2, 1 }, { 1, 1 }, 4, false));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,   GGML_TYPE_BQ2_0, {512, 4, 3, 2}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_BQ2_0, GGML_TYPE_F32,   {512, 4, 3, 2}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_BQ2_0, GGML_TYPE_F16,   {512, 4, 3, 2}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_BQ2_0, GGML_TYPE_F16,   {64, 8, 33, 2}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {256, 4, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 4, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));

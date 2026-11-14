@@ -43,6 +43,42 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
     }
 }
 
+// KV1 BQ2_0: bit-identical to the CPU reference / training quantizer.
+// The CUDA backend is built with -use_fast_math, so the arithmetic uses explicit IEEE round-to-nearest intrinsics.
+static __device__ void quantize_f32_bq2_0_block(const float * __restrict__ x, block_bq2_0 * __restrict__ y) {
+    float mn = x[0];
+    float mx = x[0];
+    for (int j = 1; j < QK_BQ2_0; ++j) {
+        mn = fminf(mn, x[j]);
+        mx = fmaxf(mx, x[j]);
+    }
+
+    float d = __fdiv_rn(__fsub_rn(mx, mn), 3.0f);
+    d = d > 1e-6f ? d : 1e-6f;
+
+    const half dh = __float2half_rn(d);
+    const half mh = __float2half_rn(mn);
+    y->d = dh;
+    y->m = mh;
+
+    const float df = __half2float(dh);
+    const float mf = __half2float(mh);
+
+    for (int j = 0; j < QK_BQ2_0/4; ++j) {
+        uint8_t b = 0;
+        for (int l = 0; l < 4; ++l) {
+            float q = rintf(__fdiv_rn(__fsub_rn(x[4*j + l], mf), df)); // half to even, like torch.round
+            q = q < 0.0f ? 0.0f : (q > 3.0f ? 3.0f : q);
+            b |= ((uint8_t) q) << (2*l);
+        }
+        y->qs[j] = b;
+    }
+}
+
+static __device__ void cpy_blck_f32_bq2_0(const char * cxi, char * cdsti) {
+    quantize_f32_bq2_0_block((const float *)cxi, (block_bq2_0 *)cdsti);
+}
+
 static __device__ void quantize_f32_q4_1_block(const float * __restrict__ x, block_q4_1 * __restrict__ y) {
     float vmin = FLT_MAX;
     float vmax = -FLT_MAX;

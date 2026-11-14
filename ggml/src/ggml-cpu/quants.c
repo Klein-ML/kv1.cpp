@@ -106,6 +106,11 @@ void quantize_row_tq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq1_0_ref(x, y, k);
 }
 
+void quantize_row_bq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_BQ2_0 == 0);
+    quantize_row_bq2_0_ref(x, (block_bq2_0 *) vy, k);
+}
+
 void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_K == 0);
     block_tq2_0 * GGML_RESTRICT y = vy;

@@ -2353,6 +2353,68 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+// KV1 BQ2_0 - must stay bit-identical to the training quantizer (kv_ternary.py, levels=4, mode="affine"):
+//   d = fp16(max((max - min) / 3, 1e-6)), m = fp16(min)
+//   q = clamp(round_half_to_even((x - m) / d), 0, 3) using the fp16-rounded m and d
+void quantize_row_bq2_0_ref(const float * GGML_RESTRICT x, block_bq2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_BQ2_0 == 0);
+    const int64_t nb = k / QK_BQ2_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i*QK_BQ2_0;
+
+        float mn = xb[0];
+        float mx = xb[0];
+        for (int j = 1; j < QK_BQ2_0; j++) {
+            mn = xb[j] < mn ? xb[j] : mn;
+            mx = xb[j] > mx ? xb[j] : mx;
+        }
+
+        float d = (mx - mn) / 3.0f;
+        d = d > 1e-6f ? d : 1e-6f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].m = GGML_FP32_TO_FP16(mn);
+
+        const float df = GGML_FP16_TO_FP32(y[i].d);
+        const float mf = GGML_FP16_TO_FP32(y[i].m);
+
+        for (int j = 0; j < QK_BQ2_0/4; j++) {
+            uint8_t b = 0;
+            for (int l = 0; l < 4; l++) {
+                float q = nearbyintf((xb[4*j + l] - mf) / df); // default rounding mode: half to even, like torch.round
+                q = q < 0.0f ? 0.0f : (q > 3.0f ? 3.0f : q);
+                b |= ((uint8_t) q) << (2*l);
+            }
+            y[i].qs[j] = b;
+        }
+    }
+}
+
+void dequantize_row_bq2_0(const block_bq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_BQ2_0 == 0);
+    const int64_t nb = k / QK_BQ2_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+
+        for (int j = 0; j < QK_BQ2_0/4; j++) {
+            const uint8_t b = x[i].qs[j];
+            for (int l = 0; l < 4; l++) {
+                y[i*QK_BQ2_0 + 4*j + l] = ((b >> (2*l)) & 3) * d + m;
+            }
+        }
+    }
+}
+
+size_t quantize_bq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // not used
+    const size_t row_size = ggml_row_size(GGML_TYPE_BQ2_0, n_per_row);
+    quantize_row_bq2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
 void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
@@ -5464,6 +5526,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
+            } break;
+        case GGML_TYPE_BQ2_0:
+            {
+                VALIDATE_ROW_DATA_DM_F16_IMPL(block_bq2_0, data, nb, d, m);
             } break;
         case GGML_TYPE_Q4_1:
             {

@@ -438,6 +438,15 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
+    // BQ2_0 (KV1 KV cache) is storage only: no vec_dot, so no matmul / flash attention reading it directly
+    if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_OUT_PROD || op->op == GGML_OP_FLASH_ATTN_EXT) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && op->src[i]->type == GGML_TYPE_BQ2_0) {
+                return false;
+            }
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:

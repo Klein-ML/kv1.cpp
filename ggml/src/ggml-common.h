@@ -277,6 +277,16 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// KV1 2-bit KV cache (BQ2_0): one block = one head vector of 64 values
+// x ~= q * d + m with q in 0..3
+#define QK_BQ2_0 64
+typedef struct {
+    ggml_half d;               // scale = (max - min) / 3
+    ggml_half m;               // min
+    uint8_t qs[QK_BQ2_0 / 4];  // 2-bit codes, 4 per byte: q0 | q1<<2 | q2<<4 | q3<<6
+} block_bq2_0;
+static_assert(sizeof(block_bq2_0) == 2*sizeof(ggml_half) + QK_BQ2_0 / 4, "wrong bq2_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

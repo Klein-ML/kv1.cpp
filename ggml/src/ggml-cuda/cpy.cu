@@ -308,6 +308,54 @@ static void ggml_cpy_f32_q4_1_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+template <typename dst_t>
+static __device__ void cpy_blck_bq2_0_flt(const char * cxi, char * cdsti) {
+    const block_bq2_0 * x = (const block_bq2_0 *) cxi;
+    dst_t * y = (dst_t *) cdsti;
+
+    const float d = __half2float(x->d);
+    const float m = __half2float(x->m);
+
+#pragma unroll
+    for (int j = 0; j < QK_BQ2_0/4; ++j) {
+        const uint8_t b = x->qs[j];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            y[4*j + l] = ggml_cuda_cast<dst_t>(((b >> (2*l)) & 3) * d + m);
+        }
+    }
+}
+
+static void ggml_cpy_f32_bq2_0_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+
+    GGML_ASSERT(ne % QK_BQ2_0 == 0);
+    const int64_t num_blocks = ne / QK_BQ2_0;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    cpy_f32_q<cpy_blck_f32_bq2_0, QK_BQ2_0><<<num_blocks, 1, 0, stream>>>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+template <typename dst_t>
+static void ggml_cpy_bq2_0_flt_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02,
+    const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
+    const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
+    cudaStream_t stream) {
+    GGML_ASSERT(ne % QK_BQ2_0 == 0);
+    const int64_t n_qblocks = ne / QK_BQ2_0;
+    const int threads = 64;
+    const int64_t num_blocks = (n_qblocks + threads - 1) / threads;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    cpy_q_f32<cpy_blck_bq2_0_flt<dst_t>, QK_BQ2_0><<<num_blocks, threads, 0, stream>>>(
+        cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
 static void ggml_cpy_q4_1_f32_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02,
@@ -514,6 +562,15 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q4_1) {
         ggml_cpy_f32_q4_1_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_BQ2_0) {
+        ggml_cpy_f32_bq2_0_cuda
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_BQ2_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cpy_bq2_0_flt_cuda<float>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_BQ2_0 && src1->type == GGML_TYPE_F16) {
+        ggml_cpy_bq2_0_flt_cuda<half>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q4_1 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_q4_1_f32_cuda
